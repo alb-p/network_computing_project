@@ -54,23 +54,24 @@ int load_maps_config(const char *config_file, struct l4_lb_bpf *skel) {
 
     // Get file descriptor of the map
     int load_map_fd = bpf_map__fd(skel->maps.load);
-    int flow_backend_map_fd = bpf_map__fd(skel->maps.flow_backend);
-    int utils_map_fd = bpf_map__fd(skel->maps.utils);
+    
 
     // Check if the file descriptor is valid
-    if (load_map_fd < 0 || flow_backend_map_fd < 0 || utils_map_fd < 0) {
-        log_error("Failed to get file descriptor of BPF maps: %s", strerror(errno));
+    if (load_map_fd < 0) {
+        log_error("Failed to get file descriptor of BPF map load: %s", strerror(errno));
         ret = EXIT_FAILURE;
         goto cleanup_yaml;
     }
 
-    /* Load the IPs in the BPF map */
+    /* Load the IPs in load map */
     for (int i = 0; i < root->backends_count; i++) {
         log_info("Loading IP %s", root->backends[i].ip);
 
         // Convert the IP to an integer
         struct in_addr addr;
+
         int ret = inet_pton(AF_INET, root->backends[i].ip, &addr);
+        log_debug("COnverted IP %s to integer %d and saddr %d",root->backends[i].ip, addr, addr.s_addr );
         if (ret != 1) {
             log_error("Failed to convert IP %s to integer", root->backends[i].ip);
             ret = EXIT_FAILURE;
@@ -78,12 +79,13 @@ int load_maps_config(const char *config_file, struct l4_lb_bpf *skel) {
         }
 
         // Now write the IP to the BPF map
-        struct map_value_t value = {
-            .threshold = ips->ips[i].threshold,
+        struct load_s value = {
+            .flows = 0,
             .packets_rcvd = 0,
+            .load = 0,
         };
 
-        ret = bpf_map_update_elem(threshold_map_fd, &addr.s_addr, &value, BPF_ANY);
+        ret = bpf_map_update_elem(load_map_fd, &addr.s_addr, &value, BPF_ANY);
         if (ret != 0) {
             log_error("Failed to update BPF map: %s", strerror(errno));
             ret = EXIT_FAILURE;
@@ -91,18 +93,22 @@ int load_maps_config(const char *config_file, struct l4_lb_bpf *skel) {
         }        
     }
 
-    // Get fd of port map
-    int port_map_fd = bpf_map__fd(skel->maps.ip_to_port);
+
+
+    // TODO: va mappata flow_backend? All'inizio è vuota :(
+    /*
+    int flow_backend_map_fd = bpf_map__fd(skel->maps.flow_backend);
+
 
     // Check if the file descriptor is valid
-    if (port_map_fd < 0) {
-        log_error("Failed to get file descriptor of BPF map: %s", strerror(errno));
+    if (flow_backend_map_fd < 0) {
+        log_error("Failed to get file descriptor of flow_backend BPF map: %s", strerror(errno));
         ret = EXIT_FAILURE;
         goto cleanup_yaml;
     }
 
-    /* Load the IPs in the BPF map */
-    for (int i = 0; i < ips->ips_count; i++) {
+    Load the IPs in the BPF map 
+    for (int i = 0; i < ; i++) {
         log_info("Loading IP %s", ips->ips[i].ip);
         log_info("Port: %d", ips->ips[i].port);
 
@@ -124,17 +130,60 @@ int load_maps_config(const char *config_file, struct l4_lb_bpf *skel) {
             goto cleanup_yaml;  
         }        
     }
+    */
+    
+
+    int utils_map_fd = bpf_map__fd(skel->maps.utils);
+    
+    // Check if the file descriptor is valid
+    if (utils_map_fd < 0) {
+        log_error("Failed to get file descriptor of utils BPF map: %s", strerror(errno));
+        ret = EXIT_FAILURE;
+        goto cleanup_yaml;
+    }
+
+    __u8 key_0 = 0;
+    __u8 key_1 = 2;
+    __u8 key_2 = 2;
+    __u8 num_be = 0;
+    __u32 zero_be = 0;
+
+    //TODO controllare se vip va convertito in int
+    ret = bpf_map_update_elem(utils_map_fd, &key_0, &(root->vip) , BPF_ANY);
+    if (ret != 0) {
+            log_error("Failed to update BPF map: %s", strerror(errno));
+            ret = EXIT_FAILURE;
+            goto cleanup_yaml;  
+        }  
+
+    for (int i = 0; i < root->backends_count; i++) {
+        num_be += 1;
+    }
+    ret = bpf_map_update_elem(utils_map_fd, &key_1, &num_be, BPF_ANY);
+    if (ret != 0) {
+        log_error("Failed to update BPF map: %s", strerror(errno));
+        ret = EXIT_FAILURE;
+        goto cleanup_yaml;  
+    }
+
+    ret = bpf_map_update_elem(utils_map_fd, &key_2, &zero_be, BPF_ANY);
+    if (ret != 0) {
+        log_error("Failed to update BPF map: %s", strerror(errno));
+        ret = EXIT_FAILURE;
+        goto cleanup_yaml;  
+          
+    }
 
 cleanup_yaml:
     /* Free the data */
-	cyaml_free(&config, &ips_schema, ips, 0);
+	cyaml_free(&config, &root_schema, root, 0);
 
     return ret;
 }
 
 int main(int argc, const char **argv) {
     return 0;
- struct l4_ *skel = NULL;
+ struct l4_lb_bpf *skel = NULL;
     int err;
     const char *config_file = NULL;
 
@@ -161,7 +210,7 @@ int main(int argc, const char **argv) {
 
     
     /* Set program type to XDP */
-    bpf_program__set_type(skel->progs.xdp_hhdv1, BPF_PROG_TYPE_XDP);
+    bpf_program__set_type(skel->progs.l4_lb, BPF_PROG_TYPE_XDP);
 
     /* Load and verify BPF programs */
     if (l4_lb_bpf__load(skel)) {

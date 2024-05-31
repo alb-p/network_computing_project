@@ -1,5 +1,5 @@
-#ifndef HHD_V1_H_
-#define HHD_V1_H_
+#ifndef L4_LB_H_
+#define L4_LB_H_
 
 #include <stdio.h>
 #include <unistd.h>
@@ -59,4 +59,9 @@ static const cyaml_config_t config = {
 	.log_level = CYAML_LOG_WARNING, /* Logging errors and warnings only. */
 };
 
-#endif //HHD_V1_H_
+void sigint_handler(int sig_no) {
+    log_debug("Closing program...");
+    exit(0);
+}
+
+#endif //L4_LB_H_
