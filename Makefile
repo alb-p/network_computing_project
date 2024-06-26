@@ -23,18 +23,17 @@ ARCH := $(shell uname -m | sed 's/x86_64/x86/' | sed 's/aarch64/arm64/' | sed 's
 # libbpf to avoid dependency on system-wide headers, which could be missing or
 # outdated
 # INCLUDES := -I$(OUTPUT) -I../libbpf/include/uapi -I$(OUTPUT)/libxdp/include -I$(LIBARGPARSE_SRC) -I$(dir $(VMLINUX))
-INCLUDES := -I$(OUTPUT) -I../../libs/libbpf/include/uapi -I$(LIBARGPARSE_SRC) -I$(LIBLOG_HDR)
+INCLUDES := -I$(OUTPUT) -I../libs/libbpf/include/uapi -I$(LIBARGPARSE_SRC) -I$(LIBLOG_HDR)
 CFLAGS := -g -Wall -DLOG_USE_COLOR
 ALL_LDFLAGS := $(LDFLAGS) $(EXTRA_LDFLAGS) 
 
-APPS = l4_lb
+APPS = l4_lb xdp_loader
 
-HHDV2_CONFIG_DEPS = libnl-3.0
-HHDV2_PKG_CFLAGS := $(shell $(PKG_CONFIG) --cflags $(HHDV2_CONFIG_DEPS))
-HHDV2_PKG_LIBS := $(shell $(PKG_CONFIG) --static --libs $(HHDV2_CONFIG_DEPS))
+L4LB_PKG_CFLAGS := $(shell $(PKG_CONFIG) --cflags $(L4LB_CONFIG_DEPS))
+L4LB_PKG_LIBS := $(shell $(PKG_CONFIG) --static --libs $(L4LB_CONFIG_DEPS))
 
-INCLUDES += $(HHDV2_PKG_CFLAGS)
-ALL_LDFLAGS += -lrt -ldl -lpthread -lm $(LIBCYAML_OBJ) -lyaml $(HHDV2_PKG_LIBS)
+INCLUDES += $(L4LB_PKG_CFLAGS)
+ALL_LDFLAGS += -lrt -ldl -lpthread -lm $(LIBCYAML_OBJ) -lyaml
 
 # Get Clang's default includes on this system. We'll explicitly add these dirs
 # to the includes list when compiling with `-target bpf` because otherwise some

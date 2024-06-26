@@ -34,65 +34,36 @@ if ! [ -x "$(command -v nmap)" ]; then
   sudo apt-get install nmap -y
 fi
 
-# Get the number of elements in the backends list
-num_backends=$(echo "$yaml" | shyaml get-length backends)
+#clean
+sudo ip link del veth2
+sudo ip netns del ns1
 
-# function cleanup: is invoked each time script exit (with or without errors)
-function cleanup {
-  set +e
-  delete_veth 2
-  # Check is second parameter is not empty
-  if [ ! -z "$2" ]; then
-    echo -e "${COLOR_GREEN} Topology deleted successfully ${COLOR_OFF}"
-  else
-    echo -e "${COLOR_RED} Error while running the script ${COLOR_OFF}"
-    echo -e "${COLOR_YELLOW} Topology deleted successfully ${COLOR_OFF}"
-  fi
-}
-trap 'cleanup "$1"' ERR
-
-# Enable verbose output
-set +x
-
-cleanup ${num_backends} 1
-
-# Check if xdp_loader is compiled, if not compile it
-if ! [ -x "$(command -v ${DIR}/xdp_loader)" ]; then
-  echo -e "${COLOR_YELLOW} WARNING: xdp_loader is not compiled ${COLOR_OFF}" >&2
-  echo -e "${COLOR_YELLOW} Compiling xdp_loader... ${COLOR_OFF}"
-  make -C ${DIR} xdp_loader
-fi
-
-if ! [ -x "$(command -v ${DIR}/xdp_loader)" ]; then
-  echo -e "${COLOR_RED} ERROR: xdp_loader is not compiled ${COLOR_OFF}" >&2
-  exit 1
-fi
-
-# Makes the script exit, at first error
-# Errors are thrown by commands returning not 0 value
 set -e
 
 
-# Create two network namespaces and veth pairs
-create_veth 2
 
-
+#get VIP
 vip=$(echo "$yaml" | shyaml get-value vip)
 echo -e "${COLOR_GREEN} VIP: $vip ${COLOR_OFF}"
 
-for ((i=0 ; i<num_backends ; i++));do
+be_nodes=$(echo "$yaml" | shyaml get-length backends)
+
+for ((i=0 ; i<be_nodes ; i++));do
   elem=$(echo "$yaml" | shyaml get-value backends.$i)
   ip=$(echo "$elem" | shyaml get-value ip)
   echo -e "${COLOR_GREEN} IP: $ip ${COLOR_OFF}"
 
 done
 sudo ip netns add ns1
+#sudo ip netns add ns2
 sudo ip link add veth1 type veth peer name veth2
 
+#ip link show
 
 sudo ip link set veth1 netns ns1
 sudo ip netns exec ns1 ip link set dev veth1 up
 
+#sudo ip link set veth2 netns ns2
 sudo ip link set dev veth2 up
 
 sudo ip netns exec ns1 ip addr add $vip/16 dev veth1 && sudo ip netns exec ns1 ip link set dev veth1 up
@@ -107,9 +78,6 @@ echo -e "${COLOR_GREEN} MAC2: $mac2 ${COLOR_OFF}"
 sudo arp -s $vip $mac1 -i veth2
 sudo ip netns exec ns1 arp -s 192.168.9.2 $mac2
 
+sleep 2
 
-sudo ifconfig veth1 ${vip}/24 up
-sudo ./xdp_loader -i veth2
-
-
-echo -e "${COLOR_GREEN} Topology created successfully ${COLOR_OFF}"
+sudo  ./xdp_loader -i veth2 

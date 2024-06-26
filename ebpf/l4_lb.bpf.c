@@ -13,16 +13,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define BE_MIN_LOAD 2
-
-
-// bpf_l3_csum_replace
-
 struct load_s {
    __u64 packets_rcvd;
    __u64 flows;
-   //computed
-   __u64 c_load;
 };
 
 struct flow_t {
@@ -31,18 +24,17 @@ struct flow_t {
    __u16 srcPort;
    __u16 dstPort;
    __u8  protocol;
-
 };
 
 struct {
    __uint(type, BPF_MAP_TYPE_HASH);
-    __type(key, __u32); //backendIP
+   __type(key, __u32); //indice=index_backend.backend_ip
    __type(value, struct load_s);
-   __uint(max_entries, 65536);
+   __uint(max_entries, 128);
 } load SEC(".maps");
 
 struct {
-   __uint(type, BPF_MAP_TYPE_HASH);
+   __uint(type, BPF_MAP_TYPE_LRU_HASH);
    __type(key, struct flow_t);
    __type(value, __u32); //backendIP
    __uint(max_entries, 65536);
@@ -50,9 +42,16 @@ struct {
 
 struct {
    __uint(type, BPF_MAP_TYPE_ARRAY);
+   __type(key, __u32); //indice
+   __type(value, __u32); //backend_ip
+   __uint(max_entries, 4096);
+} index_backend SEC(".maps");
+
+struct {
+   __uint(type, BPF_MAP_TYPE_ARRAY);
    __type(key, __u32); //selettore
    __type(value, __u32); //vip, numero be, beIP_min_load
-   __uint(max_entries, 65536);
+   __uint(max_entries, 128);
 } utils SEC(".maps");
 
 static __always_inline int parse_ethhdr(void *data, void *data_end, __u16 *nh_off, struct ethhdr **ethhdr) {
@@ -137,43 +136,61 @@ __attribute__((__always_inline__)) static inline void ipv4_csum_inline(void *iph
   *csum = csum_fold_helper(*csum);
 }
 
-static __always_inline int ipi_encap(struct xdp_md *ctx, __u32 be_ip){
+
+static __always_inline int ipi_encap(struct xdp_md *ctx, __u32 dest_ip){
    void *data;
    void *data_end;
    struct iphdr *new_iph;
    struct iphdr *old_iph;
    struct ethhdr *new_eth;
-   struct ethhdr *old_eth;
-   __u64 csum = 0;
-
-   if (bpf_xdp_adjust_head(ctx, 0 - (int)sizeof(struct iphdr)))
-   {
-      return -1;
-   }
+   struct ethhdr old_eth;
+   __u64 csum = -1;
+   __u32 ip_len = 0;
    
    data = (void *)(long)ctx->data;
    data_end = (void *)(long)ctx->data_end;
-   old_eth = data;
+
+   if ((void *)data + sizeof(struct ethhdr) > data_end)
+      return -1;
+   __builtin_memcpy(&old_eth, data, sizeof(struct ethhdr));
+
    old_iph = data + sizeof(struct ethhdr);
+   if ((void *)data + sizeof(struct iphdr) > data_end)
+      return -2;
+   ip_len = old_iph->ihl * 4;
 
    
+   if (bpf_xdp_adjust_head(ctx, 0 - ip_len)) {
+      return -3;
+   }
    data = (void *)(long)ctx->data;
    data_end = (void *)(long)ctx->data_end;
 
    new_eth = data;
-   new_iph = data + sizeof(struct ethhdr);
+   //copy old_eth in the new memory area
+   if ((void *)new_eth + sizeof(struct ethhdr) > data_end)
+      return -4;
+   __builtin_memcpy(new_eth, &old_eth, sizeof(struct ethhdr));
+
+   unsigned char temp_addr[ETH_ALEN];
+   __builtin_memcpy(temp_addr, new_eth->h_dest, ETH_ALEN);
+   __builtin_memcpy(new_eth->h_dest, new_eth->h_source, ETH_ALEN);
+   __builtin_memcpy(new_eth->h_source, temp_addr, ETH_ALEN);
+
+
+   //copy the old ip header in the new memory area
+   new_iph = (void *)new_eth + sizeof(struct ethhdr);
+   if ((void *)new_iph + sizeof(struct iphdr) > data_end)
+      return -5;
    
-   if ((void *)new_eth + 1 > data_end || (void *)old_eth + 1 > data_end || (void *)new_iph + (sizeof(struct iphdr)) > data_end){
-         return -1;
-   }
+   old_iph = data + sizeof(struct ethhdr) + ip_len;
+   if((void *)old_iph + sizeof(struct iphdr) > data_end)
+      return -6;
+
    
-   //copy all the field of old_eth to new_eth
-   __builtin_memcpy(new_eth->h_dest, old_eth->h_dest, 6);
-   __builtin_memcpy(new_eth->h_source, old_eth->h_source, 6);
-   new_eth->h_proto = bpf_htons(ETH_P_IP);
 
    new_iph->addrs = old_iph->addrs;
-   new_iph->daddr = be_ip;
+   new_iph->daddr = dest_ip;
    new_iph->frag_off = old_iph->frag_off;
    new_iph->id = old_iph->id;
    new_iph->ihl = old_iph->ihl;
@@ -184,15 +201,13 @@ static __always_inline int ipi_encap(struct xdp_md *ctx, __u32 be_ip){
    new_iph->ttl = old_iph->ttl;
    new_iph->version = old_iph->version;
 
+   bpf_printk("DEST IP (after encapsulation): %x", dest_ip);
+
    ipv4_csum_inline(new_iph, &csum);
    new_iph->check = csum;
 
-   return 1;
-   }
-
-
-
-
+   return csum;
+}
 
 SEC("xdp")
 int l4_lb(struct xdp_md *ctx) {
@@ -200,11 +215,7 @@ int l4_lb(struct xdp_md *ctx) {
    void *data = (void *)(long)ctx->data;
    int eth_type, ip_type;
    struct flow_t flow;
-
-
-
    __u16 nf_off = 0;
-
    struct ethhdr *eth;
    struct udphdr *udp;
    int action = XDP_PASS;
@@ -235,15 +246,13 @@ int l4_lb(struct xdp_md *ctx) {
    }
 
    //crea 5-tupla della connessione appena arrivata, sarà chiave per cercare il flow nella map
-
-
    flow.IPsrc = ip->saddr;
    flow.IPdst = ip->daddr;
    flow.srcPort = udp->source;
    flow.dstPort = udp->dest;
    flow.protocol = ip_type;
 
-   bpf_printk("Flows info: IPsrc:%u,IPdst:%u, srcPort:%u,dstPort:%u, proto:%d", flow.IPsrc,flow.IPdst, flow.srcPort, flow.dstPort, flow.protocol);
+   bpf_printk("Flows info: IPsrc:%x,IPdst:%x, srcPort:%u,dstPort:%u, proto:%d", flow.IPsrc,flow.IPdst, flow.srcPort, flow.dstPort, flow.protocol);
 
    //eventually existing flow's structure
    struct flow_t *existing_flow;
@@ -253,73 +262,58 @@ int l4_lb(struct xdp_md *ctx) {
    struct load_s *load_be;
    int res = -1;
 
-   //lookup sulla mappa per vedere se il flow esiste già. nel caso ritorna un flow
+   //lookup sulla mappa per vedere se il flow è già assegnato ad un be e nel caso lo ritorna
    be_ip = bpf_map_lookup_elem(&flow_backend, &flow);
+   
    if(be_ip != NULL){
       //flow is already existing, take the load info
-      load_be = bpf_map_lookup_elem(&load, &be_ip);
+      load_be = bpf_map_lookup_elem(&load, be_ip);
       if (!load_be){
          bpf_printk("It was not possible to lookup for the load");
          return XDP_ABORTED;
       }
-      bpf_printk("Load of the selected backend: %d", load_be->c_load);
-      load_be->packets_rcvd = load_be->packets_rcvd +1;
-      if (load_be->flows > 0) {
-         load_be->c_load = load_be->packets_rcvd / load_be->flows;
-      } else {
-         load_be->c_load = load_be->packets_rcvd;
-      }
 
-      
+      bpf_printk("Load of the selected backend(%x): %d", *be_ip, load_be->packets_rcvd);
 
-      res = bpf_map_update_elem(&load, &be_ip, load_be, BPF_EXIST);
-      if(res < 0){
-         bpf_printk("It was not possible to update the load");
-         return XDP_ABORTED;
-      }
+      __sync_fetch_and_add(&load_be->packets_rcvd, 1);
 
    } else { //devo creare il nuovo legame tra flow e il backend con min load
       // retrieve the load min backend
+      bpf_printk("Flow not found");
       int key = 2; 
-      __u32 *be_ip_ptr = bpf_map_lookup_elem(&utils, &key);
-      be_ip = be_ip_ptr;
-      if (be_ip_ptr) {
-         __u32 be_ip_val = *be_ip_ptr;
-         res = bpf_map_update_elem(&flow_backend, &flow, &be_ip_val, BPF_NOEXIST);
+      be_ip = bpf_map_lookup_elem(&utils, &key);
+      if (be_ip) {
+         bpf_printk("Selected backend: %x", *be_ip);
+         res = bpf_map_update_elem(&flow_backend, &flow, be_ip, BPF_ANY);
          if (res < 0) {
             bpf_printk("An error occurred during the association of a new flow");
             return XDP_ABORTED;
          }
          // update the laod (pkt and flow)
-         load_be = bpf_map_lookup_elem(&load, &be_ip_val);
+         load_be = bpf_map_lookup_elem(&load, be_ip);
          if (!load_be){
             bpf_printk("It was not possible to lookup for the load");
             return XDP_ABORTED;
          }
-         load_be->packets_rcvd +=1;
-         load_be->flows +=1;
-         load_be->c_load = load_be->packets_rcvd/load_be->flows;
-
-         res = bpf_map_update_elem(&load, &be_ip_val, load_be, BPF_EXIST);
-         if(res < 0){
-            bpf_printk("It was not possible to update the load");
-            return XDP_ABORTED;
-         } else {
-         bpf_printk("Could not find backend with minimum load");
+         __sync_fetch_and_add(&load_be->packets_rcvd, 1);
+         __sync_fetch_and_add(&load_be->flows, 1);
+        
+      } else {
+         bpf_printk("Failed to find the backend IP");
          return XDP_ABORTED;
-         }
       }
 
    }
 
+   __u32 dest_ip = *be_ip;
+
    //IP-to-IP encapsulation   
-   //res = ipi_encap(ctx, *be_ip);
-   //args->dst_mac, bpf_htonl(args->saddr), bpf_htonl(args->daddr), payload_len);
+   res = ipi_encap(ctx, dest_ip);
    if(res < 0){
-            bpf_printk("It was not possible to encapsulate the packet");
-            return XDP_ABORTED;
-         }
-   bpf_printk("sending back %d", res);
+      bpf_printk("It was not possible to encapsulate the packet, res: %d\n", res);
+      return XDP_ABORTED;
+   }
+   bpf_printk("sending back\n");
    return XDP_TX;
 
    
