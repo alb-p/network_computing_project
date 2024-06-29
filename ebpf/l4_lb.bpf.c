@@ -36,7 +36,7 @@ struct {
 struct {
    __uint(type, BPF_MAP_TYPE_LRU_HASH);
    __type(key, struct flow_t);
-   __type(value, __u32); //backendIP
+   __type(value, __u32); //backendIndex
    __uint(max_entries, 65536);
 } flow_backend SEC(".maps");
 
@@ -187,8 +187,6 @@ static __always_inline int ipi_encap(struct xdp_md *ctx, __u32 dest_ip){
    if((void *)old_iph + sizeof(struct iphdr) > data_end)
       return -6;
 
-   
-
    new_iph->addrs = old_iph->addrs;
    new_iph->daddr = dest_ip;
    new_iph->frag_off = old_iph->frag_off;
@@ -207,6 +205,45 @@ static __always_inline int ipi_encap(struct xdp_md *ctx, __u32 dest_ip){
    new_iph->check = csum;
 
    return csum;
+}
+// Struct for callback context
+struct callback_ctx {
+    struct xdp_md *ctx;
+    unsigned int min_index;
+    unsigned long long min_ratio;
+};
+
+// Callback function to find the minimum packets_rcvd/flows ratio
+static __u64 find_min_load(struct bpf_map *map, __u32 *key, struct load_s *value,
+                            struct callback_ctx *data)
+{
+
+   bpf_printk("Finding the min load backend, key: %d, value: %d", *key, value->packets_rcvd);
+    // Calculate the packets_rcvd/flows ratio
+    unsigned long long ratio = 0;
+    if (value->flows > 0) {
+        ratio = value->packets_rcvd / value->flows;
+    }
+
+    // Check if this ratio is smaller than the current minimum
+    if (ratio < data->min_ratio) {
+        data->min_ratio = ratio;
+        data->min_index = *key;  // Save the key (index) of the minimum element
+    }
+
+    return 0;  // Always return 0 to continue iteration
+}
+
+static __always_inline __u32 find_min_load_be_index(struct xdp_md *ctx){
+   bpf_printk("Finding the min load backend");
+
+   struct callback_ctx data = {
+        .min_index = 0,
+        .min_ratio = 1000000,  // Initialized to a large number
+   };
+   bpf_for_each_map_elem(&load, find_min_load, &data, 0);
+   return data.min_index;
+   
 }
 
 SEC("xdp")
@@ -257,63 +294,99 @@ int l4_lb(struct xdp_md *ctx) {
    //eventually existing flow's structure
    struct flow_t *existing_flow;
    //backend ip to which the flow will be direct 
-   __u32 *be_ip;
+   __u32 *be_index;
    //selected backend's load info structure
    struct load_s *load_be;
    int res = -1;
 
    //lookup sulla mappa per vedere se il flow è già assegnato ad un be e nel caso lo ritorna
-   be_ip = bpf_map_lookup_elem(&flow_backend, &flow);
+   be_index = bpf_map_lookup_elem(&flow_backend, &flow);
    
-   if(be_ip != NULL){
+   
+   if(be_index != NULL){
       //flow is already existing, take the load info
-      load_be = bpf_map_lookup_elem(&load, be_ip);
+      bpf_printk("Flow existing: %x", *be_index);
+      load_be = bpf_map_lookup_elem(&load, be_index);
       if (!load_be){
-         bpf_printk("It was not possible to lookup for the load");
+         bpf_printk("Flow existing. It was not possible to lookup for the load");
          return XDP_ABORTED;
       }
 
-      bpf_printk("Load of the selected backend(%x): %d", *be_ip, load_be->packets_rcvd);
+      bpf_printk("Load of the selected backend(%x): %d", *be_index, load_be->packets_rcvd);
 
       __sync_fetch_and_add(&load_be->packets_rcvd, 1);
 
    } else { //devo creare il nuovo legame tra flow e il backend con min load
       // retrieve the load min backend
       bpf_printk("Flow not found");
-      int key = 2; 
-      be_ip = bpf_map_lookup_elem(&utils, &key);
-      if (be_ip) {
-         bpf_printk("Selected backend: %x", *be_ip);
-         res = bpf_map_update_elem(&flow_backend, &flow, be_ip, BPF_ANY);
+      __u32 be_min_index = -1;
+      be_min_index = find_min_load_be_index(ctx);
+
+      if (be_min_index >= 0) {
+         bpf_printk("Selected backend by find_: %x", be_min_index);
+         res = bpf_map_update_elem(&flow_backend, &flow, &be_min_index, BPF_ANY);
          if (res < 0) {
             bpf_printk("An error occurred during the association of a new flow");
             return XDP_ABORTED;
          }
+
+         __u32 *be_flow= bpf_map_lookup_elem(&flow_backend, &flow);
+         if(be_flow){
+            bpf_printk("Flow associated to backend: %x", *be_flow);
+         } else {
+            bpf_printk("It was not possible to lookup for the backend IP");
+            return XDP_ABORTED;
+         }
+
+         
          // update the laod (pkt and flow)
-         load_be = bpf_map_lookup_elem(&load, be_ip);
+         //be_min_index = 2;
+         load_be = bpf_map_lookup_elem(&load, &be_min_index);
          if (!load_be){
             bpf_printk("It was not possible to lookup for the load");
             return XDP_ABORTED;
+         } else {
+            bpf_printk("Load of the selected backend(%x)%d: %d", be_min_index,be_min_index, load_be->packets_rcvd);
          }
          __sync_fetch_and_add(&load_be->packets_rcvd, 1);
          __sync_fetch_and_add(&load_be->flows, 1);
+
         
       } else {
-         bpf_printk("Failed to find the backend IP");
+         bpf_printk("Failed to find the min load backend IP");
+         return XDP_ABORTED;
+      }
+      
+      
+
+   }
+   __u32 *be_flow;
+   be_flow = bpf_map_lookup_elem(&flow_backend, &flow);
+   if(be_flow){
+         bpf_printk("Backend associated to flow: %x", *be_flow);
+      } else {
+         bpf_printk("__It was not possible to lookup for the backend IP");
          return XDP_ABORTED;
       }
 
-   }
-
-   __u32 dest_ip = *be_ip;
+   __u32 *dest_ip = bpf_map_lookup_elem(&index_backend, be_flow);
+      if(dest_ip){
+         bpf_printk("Destination backend: %x", *dest_ip);
+      } else {
+         bpf_printk("It was not possible to lookup for the backend IP__");
+         return XDP_ABORTED;
+      }
+   find_min_load_be_index(ctx);
 
    //IP-to-IP encapsulation   
-   res = ipi_encap(ctx, dest_ip);
+   res = ipi_encap(ctx, *dest_ip);
    if(res < 0){
-      bpf_printk("It was not possible to encapsulate the packet, res: %d\n", res);
+      bpf_printk("It was not possible to encapsulate the packet, res: %d\\n", res);
       return XDP_ABORTED;
    }
-   bpf_printk("sending back\n");
+
+   
+   bpf_printk("sending back\\n");
    return XDP_TX;
 
    
