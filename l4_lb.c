@@ -23,10 +23,15 @@
     #include "log.h"
     #include "l4_lb.h"
 
+    static const char *const usages[] = {
+    "l4_lb [options] [[--] args]",
+    "l4_lb [options]",
+    NULL,
+    };
+
     struct load_s {
     __u64 packets_rcvd;
     __u64 flows;
-    // __u64 load;
     };
 
     struct flow_t {
@@ -63,6 +68,7 @@
             goto cleanup_yaml;
         }
 
+        // File descriptor of index_backend map
         int backends_map_fd = bpf_map__fd(skel->maps.index_backend);
         if (backends_map_fd < 0) {
             log_error("Failed to get file descriptor of BPF map backends: %s", strerror(errno));
@@ -84,7 +90,7 @@
             }
 
             ret = bpf_map_update_elem(backends_map_fd, &i, &addr.s_addr, BPF_ANY);
-            log_info("Loaded backend IP %x", addr.s_addr);
+            log_info("Loaded backend IP %x, index %d", addr.s_addr, i);
             if (ret != 0) {
                 log_error("Failed to update BPF map: %s", strerror(errno));
                 ret = EXIT_FAILURE;
@@ -95,8 +101,7 @@
                 .packets_rcvd = 0,
                 .flows = 1,
             };
-
-            ret = bpf_map_update_elem(load_map_fd, &addr.s_addr, &value, BPF_ANY);
+            ret = bpf_map_update_elem(load_map_fd, &i, &value, BPF_ANY);
             if (ret != 0) {
                 log_error("Failed to update BPF map: %s", strerror(errno));
                 ret = EXIT_FAILURE;
@@ -117,7 +122,7 @@
         struct in_addr addr;
 
         ret = inet_pton(AF_INET, root->vip, &addr);
-        log_debug("Converted VIP %s to integer %d and saddr %d",root->vip, addr, addr.s_addr );
+        log_debug("Converted VIP %s to integer %d and saddr %x",root->vip, addr, addr.s_addr );
         if (ret != 1) {
             log_error("Failed to convert IP %s to integer", root->vip);
             ret = EXIT_FAILURE;
@@ -142,22 +147,6 @@
             goto cleanup_yaml;  
         }
 
-        key = 2;
-        struct in_addr addr_be;
-        ret = inet_pton(AF_INET, root->backends[0].ip, &addr_be);
-        if (ret != 1) {
-            log_error("Failed to convert IP %s to integer", root->backends[0].ip);
-            ret = EXIT_FAILURE;
-            goto cleanup_yaml;
-        }
-        ret = bpf_map_update_elem(utils_map_fd, &key, &addr_be, BPF_ANY);
-        if (ret != 0) {
-            log_error("Failed to update BPF map: %s", strerror(errno));
-            ret = EXIT_FAILURE;
-            goto cleanup_yaml;  
-            
-        }
-
         return num_be;
 
     cleanup_yaml:
@@ -166,13 +155,8 @@
         return ret;
     }
 
-    int update_min_load(struct l4_lb_bpf *skel, int num_be) {
-        int err;
-        int key = 2;
-        __u32 min_be_ip;
-        struct load_s curr_min_load;
-        float min_load;
-
+    int start_info_print(struct l4_lb_bpf *skel, int num_be){
+        
         int load_map_fd = bpf_map__fd(skel->maps.load);
         int backends_map_fd = bpf_map__fd(skel->maps.index_backend);
         int flow_backend_map_fd = bpf_map__fd(skel->maps.flow_backend);
@@ -183,10 +167,10 @@
             return EXIT_FAILURE;
         }
 
-        for (int i = 0; i<3; i++){
+        //debug utils map
+        for (int i = 0; i<2; i++){
             __u32 res;
             bpf_map_lookup_elem(utils_map_fd, &i, &res);
-            //debug previous line
             log_debug("Utils map: %x, i: %d", res, i);
         }
 
@@ -197,66 +181,48 @@
             log_debug("Backend map: %x, i: %d", res, i);
             //check also the relative load
             struct load_s load;
-            bpf_map_lookup_elem(load_map_fd, &res, &load);
+            bpf_map_lookup_elem(load_map_fd, &i, &load);
             log_debug("Load map: %d, be_ip: %x", load.packets_rcvd, res);
         }
 
-        key = 2;
-        while(1){
-            
-            err = bpf_map_lookup_elem(utils_map_fd, &key, &min_be_ip);
-            if(err < 0){
-                log_error("Failed to lookup BPF map: %s", strerror(errno));
-                return EXIT_FAILURE;
-            }
-
-            err = bpf_map_lookup_elem(load_map_fd, &min_be_ip, &curr_min_load);
-            if(err < 0){
-                log_error("Failed to update load BPF map:%x, %s",load_map_fd, strerror(errno));
-                return EXIT_FAILURE;
-            }
-
-            min_load = (float) curr_min_load.packets_rcvd/curr_min_load.flows;
-            log_debug("Min load: %f, backend_ip: %x", min_load, min_be_ip);
-            for(int i = 0; i < num_be; i++){
-                struct load_s load;
-                //lookup for the backend ip in the backends map
-                __u32 under_test_be_ip;
-                err = bpf_map_lookup_elem(backends_map_fd, &i, &under_test_be_ip);
-                err += bpf_map_lookup_elem(load_map_fd, &under_test_be_ip, &load);
-                if(err < 0){
-                    log_error("Failed to load BPF maps");
-                    return EXIT_FAILURE;
-                }
-                float under_test_load = (float) load.packets_rcvd/load.flows;
-                //log_debug 
-                log_debug("Be_ip: %x, load: %f, #pkt: %d, #flows: %d", under_test_be_ip, under_test_load, load.packets_rcvd, load.flows);
-
-                if((float) under_test_load < min_load){
-                    min_load = under_test_load;
-                    min_be_ip = i;
-                    err = bpf_map_update_elem(utils_map_fd, &key, &under_test_be_ip, BPF_ANY);
-                    if(err < 0){
-                        log_error("Failed to update BPF map: %s", strerror(errno));
-                        return EXIT_FAILURE;
-                    }
-                }
-
-                //debug should wait some time before prints again all the info
-                //usleep(100000);
-            }  
-
-            unsigned int mSeconds = 1000;
-            usleep(mSeconds);
+        for (int i = 0; i < num_be; i++){
+            __u32 res;
+            bpf_map_lookup_elem(flow_backend_map_fd, &i, &res);
+            log_debug("Flow-Backend map: %x, i: %d", res, i);
         }
-        return EXIT_SUCCESS;
+        return 0;
 
     }
+
 
     int main(int argc, const char **argv) {
         struct l4_lb_bpf *skel = NULL;
         cyaml_err_t err;
-        const char *config_file = NULL;   
+        const char *config_file = NULL;
+        const char *iface = NULL;
+
+        struct argparse_option options[] = {
+            OPT_HELP(),
+            OPT_GROUP("Basic options"),
+            OPT_STRING('c', "config", &config_file, "Path to the YAML configuration file", NULL, 0, 0),
+            OPT_STRING('i', "iface", &iface, "Interface where to attach the BPF program", NULL, 0, 0),
+            OPT_END(),
+        };   
+        struct argparse argparse;
+        argparse_init(&argparse, options, usages, 0);
+        argparse_describe(&argparse,
+                        "\nA Layer 4 load balancer operates at the transport layer of the OSI model,"
+                        "\ndirecting client requests based on data from network and transport "
+                        "\nlayer protocols, such as IP addresses and TCP/UDP ports.",
+                        "\nThe '-i' argument is used to specify the "
+                        "interface where to attach the program");
+        argc = argparse_parse(&argparse, argc, argv);
+
+
+        if (iface == NULL) {
+            log_warn("Use default interface: %s", "veth1");
+            iface = "veth1";
+        }   
 
         if (config_file == NULL) {
             log_warn("Use default configuration file: %s", "config.yaml");
@@ -312,19 +278,20 @@
 
         xdp_flags = 0;
         xdp_flags |= XDP_FLAGS_DRV_MODE;
-        const char *iface1 = "veth1";
+        //const char *iface1 = "veth1";
         // sudo ip netns exec ns1 ./l4_lb
-        int ifindex_iface1 = if_nametoindex(iface1);
-        log_info("XDP program will be attached to %s interface (ifindex: %d)", iface1, ifindex_iface1);
+        int ifindex_iface1 = if_nametoindex(iface);
+        log_info("XDP program will be attached to %s interface (ifindex: %d)", iface, ifindex_iface1);
         err = bpf_xdp_attach(ifindex_iface1, bpf_program__fd(skel->progs.l4_lb), xdp_flags, NULL);
         if (err) {
             log_fatal("Error while attaching 1st XDP program to the interface");
             goto cleanup;
         }
+        
 
         log_info("Successfully attached!");
-        update_min_load(skel, num_be);
-        sleep(1000000);
+        //start_info_print(skel, num_be);
+        sleep(10000);
 
     cleanup:
     bpf_xdp_detach(ifindex_iface1, xdp_flags, NULL);
