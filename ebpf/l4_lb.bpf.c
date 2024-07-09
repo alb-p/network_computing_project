@@ -261,14 +261,6 @@ static __always_inline __u32 find_min_load_be_index(struct xdp_md *ctx){
    __u32 key = 2;
    int res = -1;
 
-   __u32 *local_min_load = bpf_map_lookup_elem(&utils, &key);
-      if (!local_min_load){
-         bpf_printk("It was not possible to lookup for the local min load");
-         return XDP_ABORTED;
-      } else {
-         bpf_printk("Local_min_load %d", *local_min_load);
-      }
-
    struct callback_ctx data = {
         .min_index = -1,
         .min_ratio = 1000000,
@@ -375,7 +367,6 @@ int l4_lb(struct xdp_md *ctx) {
       bpf_printk("Flow not found");
       __u32 be_min_index = -1;
       be_min_index = find_min_load_be_index(ctx);
-      //be_min_index = find_for_min_load_be_index(ctx);
 
       if (be_min_index >= 0) {
          bpf_printk("Selected backend by find_: %x", be_min_index);
@@ -430,6 +421,8 @@ int l4_lb(struct xdp_md *ctx) {
          //bpf_printk("It was not possible to lookup for the backend IP__");
          return XDP_ABORTED;
       }
+      
+   //print just for  debug purposes
    find_min_load_be_index(ctx);
 
    //IP-to-IP encapsulation   
