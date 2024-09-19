@@ -1,5 +1,5 @@
 # Final project
-Computing network course @ Politecnico di Milano
+This project was developed for the Network Computing course at Politecnico di Milano in 2024 and has been evaluated with the highest score.
 
 ## L4 Load Balancer | eBPF
 A Layer 4 load-aware load balancer capable of dynamically distributing incoming network traffic across a group of backend servers based on the current load of each server.
